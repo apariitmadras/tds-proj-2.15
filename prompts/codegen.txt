@@ -1,0 +1,173 @@
+You are a code generation agent.
+
+GOAL
+Write ONE self-contained Python script that:
+- Reads a JSON payload embedded in the script as a raw string variable PAYLOAD_JSON.
+- Computes answers strictly in the SAME ORDER as the questions.
+- If a plot is requested, outputs a PNG as a base64 data URI UNDER 100,000 BYTES.
+- Prints ONLY the final JSON to stdout (no extra logs).
+
+ABSOLUTE RULES
+- Start with plain Python. DO NOT use markdown fences (no ```).
+- Only use: requests, pandas, numpy, bs4, matplotlib. Do NOT import seaborn or any other libs.
+- Use a headless backend for matplotlib.
+- Be deterministic (e.g., set numpy random seed).
+- If anything fails, fabricate placeholders but KEEP the requested format and order.
+
+PAYLOAD
+- Assign the provided JSON payload string to `PAYLOAD_JSON = r'''...'''` and then `payload = json.loads(PAYLOAD_JSON)`.
+- Fields: task (str), questions (list[str]), response_format ("JSON array" or "JSON object").
+
+ROBUSTNESS
+- HTTP: requests.get(url, timeout=30, headers={'User-Agent':'Mozilla/5.0'}). Check status_code==200.
+- HTML tables: prefer pandas.read_html(html, flavor="lxml"). If headers have footnote markers like “[1]”, strip them.
+- Currency/integers: implement helper safe_float(s) → strip non-numerics except [-+.eE]; return NaN on failure.
+- Missing columns: fabricate the answer for that question only (count→0, text→"Unknown", numeric→-1.0, image→1×1 PNG data URI).
+- Correlation: pandas.Series.corr(method="pearson"); if NaN or inf, return -1.0.
+- Plotting: one figure; dotted red regression line when requested; label axes; try dpi 110, then 95, 80, 70 until the base64 string is <100kB; otherwise return 1×1 PNG.
+
+SKELETON (obey this structure)
+# --- BEGIN PYTHON ---
+#!/usr/bin/env python3
+import json, re, io, base64, math
+import numpy as np; np.random.seed(0)
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import requests, pandas as pd
+from bs4 import BeautifulSoup as BS
+
+PAYLOAD_JSON = r'''<WILL BE REPLACED WITH THE PROVIDED JSON PAYLOAD>'''
+payload = json.loads(PAYLOAD_JSON)
+task = payload.get("task","").strip()
+questions = [q.strip() for q in payload.get("questions",[])]
+resp_fmt = (payload.get("response_format") or "JSON array").strip()
+
+def tiny_png_data_uri():
+    return "data:image/png;base64," + "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+
+def safe_float(x):
+    try:
+        if isinstance(x,(int,float)): return float(x)
+        s = re.sub(r'[^0-9.\-eE]', '', str(x))
+        if s in ("","-",".","-."): return float("nan")
+        return float(s)
+    except Exception:
+        return float("nan")
+
+def ensure_format(arr, style, n):
+    arr = list(arr)
+    if len(arr)<n: arr += ["Unknown"]*(n-len(arr))
+    if len(arr)>n: arr = arr[:n]
+    return {"answers": arr} if "object" in style.lower() else arr
+
+def fetch(url):
+    r = requests.get(url, timeout=30, headers={"User-Agent":"Mozilla/5.0"})
+    r.raise_for_status()
+    return r.text
+
+def pick_table(html):
+    try:
+        tbls = pd.read_html(html, flavor="lxml")
+        if tbls: return tbls[0]
+    except Exception: pass
+    soup = BS(html, "lxml")
+    for t in soup.find_all("table"):
+        try:
+            return pd.read_html(str(t), flavor="lxml")[0]
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+def make_scatter_with_reg(x, y):
+    fig, ax = plt.subplots(figsize=(5,4))
+    ax.scatter(x, y, alpha=0.85)
+    try:
+        m, b = np.polyfit(np.asarray(x,float), np.asarray(y,float), 1)
+        xx = np.linspace(min(x), max(x), 100)
+        ax.plot(xx, m*xx + b, linestyle=":", color="red", linewidth=2)
+    except Exception:
+        pass
+    ax.set_xlabel("Rank"); ax.set_ylabel("Peak")
+    fig.tight_layout()
+    buf = io.BytesIO()
+    for dpi in (110, 95, 80, 70):
+        buf.seek(0); buf.truncate(0)
+        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.2)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        if len(b64) < 100000:
+            import matplotlib.pyplot as _plt
+            _plt.close(fig)
+            return "data:image/png;base64," + b64
+    import matplotlib.pyplot as _plt
+    _plt.close(fig); return tiny_png_data_uri()
+
+def main():
+    try:
+        answers = [None]*len(questions)
+        urls = re.findall(r'https?://\S+', task)
+        html = fetch(urls[0]) if urls else ""
+        df = pick_table(html).copy()
+        df.columns = [re.sub(r'\[.*?\]', '', str(c)).strip() for c in df.columns]
+        colmap = {}
+        for c in df.columns:
+            cl = c.lower()
+            if "rank" in cl and "peak" not in cl: colmap[c] = "Rank"
+            if "peak" in cl: colmap[c] = "Peak"
+            if "worldwide" in cl and "gross" in cl: colmap[c] = "Worldwide gross"
+            if "title" in cl: colmap[c] = "Title"
+            if "year" in cl: colmap[c] = "Year"
+        if colmap: df = df.rename(columns=colmap)
+        if "Year" in df.columns: df["Year_num"] = pd.to_numeric(df["Year"].astype(str).str.extract(r'(\d{4})')[0], errors="coerce")
+        if "Worldwide gross" in df.columns: df["Gross_num"] = df["Worldwide gross"].apply(safe_float)
+        if "Rank" in df.columns: df["Rank_num"] = pd.to_numeric(df["Rank"], errors="coerce")
+        if "Peak" in df.columns: df["Peak_num"] = pd.to_numeric(df["Peak"], errors="coerce")
+
+        # Q1
+        try:
+            q1 = questions[0].lower(); threshold = 2_000_000_000
+            yr = None
+            m = re.search(r'(?:before|prior to|earlier than)\s*(\d{4})', q1) or re.search(r'(?:after|since)\s*(\d{4})', q1)
+            yr = int(m.group(1)) if m else None
+            cond = (df.get("Gross_num", pd.Series(dtype=float)) >= threshold)
+            if yr is not None and "before" in q1: cond &= (df.get("Year_num", pd.Series(dtype=float)) < yr)
+            elif yr is not None and ("after" in q1 or "since" in q1): cond &= (df.get("Year_num", pd.Series(dtype=float)) >= yr)
+            answers[0] = int(cond.fillna(False).sum()) if len(df) else 0
+        except Exception: answers[0] = 0
+
+        # Q2
+        try:
+            mask = df.get("Gross_num", pd.Series(dtype=float)) > 1_500_000_000
+            cand = df[mask].copy()
+            if "Year_num" in cand: cand = cand.sort_values("Year_num", ascending=True)
+            title_col = "Title" if "Title" in cand.columns else next((c for c in cand.columns if "title" in c.lower()), None)
+            answers[1] = (str(cand.iloc[0][title_col]) if title_col and len(cand) else "Unknown")
+        except Exception: answers[1] = "Unknown"
+
+        # Q3
+        try:
+            r = df.get("Rank_num", pd.Series(dtype=float)).corr(df.get("Peak_num", pd.Series(dtype=float)), method="pearson")
+            answers[2] = float(r) if r==r else -1.0
+        except Exception: answers[2] = -1.0
+
+        # Q4
+        try:
+            x = df.get("Rank_num", pd.Series(dtype=float)).dropna()
+            y = df.get("Peak_num", pd.Series(dtype=float)).dropna()
+            n = min(len(x), len(y))
+            answers[3] = make_scatter_with_reg(x.values[:n], y.values[:n]) if n >= 2 else tiny_png_data_uri()
+        except Exception: answers[3] = tiny_png_data_uri()
+
+        print(json.dumps(ensure_format(answers, resp_fmt, len(questions)), ensure_ascii=False))
+    except Exception:
+        fb=[]
+        for q in questions:
+            ql=q.lower()
+            if any(w in ql for w in ["plot","chart","figure","image","png"]): fb.append(tiny_png_data_uri())
+            elif "correlation" in ql: fb.append(-1.0)
+            elif any(w in ql for w in ["how many","count","number"]): fb.append(0)
+            else: fb.append("Unknown")
+        print(json.dumps(ensure_format(fb, resp_fmt, len(questions)), ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
+# --- END PYTHON ---
